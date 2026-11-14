@@ -444,6 +444,31 @@ fn oidc_is_required_without_the_auth_service() {
     }
 }
 
+/// A deployment that mints its own tokens has no login to advertise, and says so.
+#[test]
+fn external_credentials_stand_in_for_oidc_and_exclude_it() {
+    for authorizer_keys in [TIER_1, TIER_2] {
+        let settings = settings_with_auth_keys(&format!(
+            r#"
+                jwt_issuer = "https://auth.example.com"
+                jwt_audience = ["lore-service"]
+                external_credentials = true
+                {authorizer_keys}
+            "#
+        ))
+        .expect("[server.auth] must parse");
+        validate_auth_config(&settings).expect("external credentials need no [server.auth.oidc]");
+    }
+
+    let both = settings_with_oidc_keys(&format!("external_credentials = true\n{TIER_1}"), "");
+    let error = validate_auth_config(&both)
+        .expect_err("external credentials and an advertised login contradict each other");
+    assert!(
+        error.to_string().contains("external_credentials"),
+        "the error must name the setting: {error}"
+    );
+}
+
 #[test]
 fn oidc_is_optional_beside_the_auth_service() {
     let settings = settings_with_auth_keys(&format!(

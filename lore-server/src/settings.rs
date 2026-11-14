@@ -295,6 +295,15 @@ fn validate_oidc_config(
     selection: AuthorizerSelection,
 ) -> Result<(), config::ConfigError> {
     let error = |message: &str| Err(config::ConfigError::Message(message.to_string()));
+    if auth.external_credentials {
+        return match auth.oidc {
+            Some(_) => error(
+                "server.auth.external_credentials says there is no login to advertise, so it \
+                 cannot be set beside [server.auth.oidc]",
+            ),
+            None => Ok(()),
+        };
+    }
     let Some(oidc) = auth.oidc.as_ref() else {
         return match selection {
             AuthorizerSelection::GlobalGrants | AuthorizerSelection::ResourceGrants => error(
@@ -484,6 +493,13 @@ pub struct AuthSettings {
     pub repository_catalog_url: Option<String>,
     /// OIDC provider settings advertised for clients.
     pub oidc: Option<OidcSettings>,
+    /// The tokens are minted by the deployment, outside any OIDC provider, and clients present
+    /// them directly (`--access-token`), so there is no login to advertise. Lifts the rule that
+    /// the grant-reading authorizers need `[server.auth.oidc]`, and advertises nothing. Refused
+    /// beside `[server.auth.oidc]`, which would advertise a login this setting says does not
+    /// exist.
+    #[serde(default)]
+    pub external_credentials: bool,
 }
 
 /// What the environment service advertises about the OIDC provider,
