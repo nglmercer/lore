@@ -186,6 +186,38 @@ impl Settings {
     }
 }
 
+impl Settings {
+    /// Builds settings for a host that embeds the server, from `overrides` layered over the
+    /// built-in defaults.
+    ///
+    /// Unlike [`Settings::load`] this reads nothing from the process environment or the
+    /// working directory, and it prints nothing: the settings may hold credentials, and an
+    /// embedding host owns its own logging. The host passes every value it wants to differ
+    /// from the defaults as TOML, in the same shape as a config file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `overrides` is not valid TOML, does not deserialize into
+    /// [`Settings`], or fails the same validation [`Settings::load`] applies.
+    pub fn from_overrides(overrides: &str) -> Result<(Self, StringHash), config::ConfigError> {
+        let settings = Config::builder()
+            .add_source(config::File::from_str(
+                DEFAULT_CONFIG_TOML,
+                config::FileFormat::Toml,
+            ))
+            .add_source(config::File::from_str(overrides, config::FileFormat::Toml))
+            .build()?;
+        let settings: Settings = settings.try_deserialize()?;
+        validate_trace_config(&settings)?;
+        validate_feature_config(&settings)?;
+        validate_auth_config(&settings)?;
+        // Hashed from the debug form, as `load` does, so a given configuration has one hash
+        // however it was loaded. The form itself is never logged.
+        let settings_hash = hash::hash_string(&format!("{settings:?}"));
+        Ok((settings, settings_hash))
+    }
+}
+
 /// Missing `jwt_issuer` / `jwt_audience` under `[server.auth]` fails
 /// deserialization. Calls repository authorizer selection logic to verify
 /// that the configuration combination is valid for authorization.

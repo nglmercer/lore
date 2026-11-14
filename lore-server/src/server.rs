@@ -213,7 +213,7 @@ pub fn server_main(config: ServerConfig) -> Result<()> {
         let execution = setup_execution(module_path!(), String::default(), String::default());
         #[allow(clippy::large_futures)]
         LORE_CONTEXT.scope(execution, async move {
-            async_main((settings, settings_hash), config).await
+            async_main((settings, settings_hash), config, ServeMode::process()).await
         })
     });
 
@@ -225,6 +225,187 @@ pub fn server_main(config: ServerConfig) -> Result<()> {
     // Released only now that the runtime has dropped every request task and what it spawned:
     // until then one could still be using the store files.
     result.map(drop)
+}
+
+/// What the caller of [`async_main`] owns, as opposed to what the server owns.
+///
+/// The standalone server owns the whole process: its tracing subscriber, its signals and its
+/// runtimes. A host that embeds the server owns those itself and asks for shutdown through
+/// [`EmbeddedServer`].
+struct ServeMode {
+    /// Whether to install the process-wide tracing subscriber.
+    install_telemetry: bool,
+    /// Whether to listen for SIGINT and SIGTERM and shut down on them.
+    listen_for_signals: bool,
+    /// Where a shutdown request is sent, and where the endpoints hear it.
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    /// Told once initialization is complete and the endpoints are spawned, and handed the
+    /// stores the server serves.
+    ready: Option<tokio::sync::oneshot::Sender<ServerStores>>,
+    /// Whether to keep serving when no endpoint is enabled, until shutdown is requested. The
+    /// standalone server has nothing to do without an endpoint and exits; a host that embeds
+    /// the server may run it for its stores and authorization alone.
+    hold_without_endpoints: bool,
+}
+
+/// The stores a running server serves, for a host that embeds it to operate on in process.
+///
+/// The server holds these stores for as long as it runs: a host operates on them only while
+/// its [`EmbeddedServer`] is running, and not after [`EmbeddedServer::stop`] returns.
+#[derive(Clone)]
+pub struct ServerStores {
+    /// The immutable content-addressed store.
+    pub immutable: Arc<dyn ImmutableStore>,
+    /// The mutable store holding branch heads and other named references.
+    pub mutable: Arc<dyn MutableStore>,
+    /// The lock store, when one is configured.
+    pub lock: Option<Arc<dyn LockStore>>,
+}
+
+impl ServeMode {
+    /// The mode of the standalone server.
+    fn process() -> Self {
+        Self {
+            install_telemetry: true,
+            listen_for_signals: true,
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            ready: None,
+            hold_without_endpoints: false,
+        }
+    }
+}
+
+/// A Lore server running inside a host process, with a lifecycle the host controls.
+///
+/// [`EmbeddedServer::start`] runs the same initialization as [`server_main`]: the stores, the
+/// authorizer, the hooks and every enabled endpoint. It differs in what it leaves to the host:
+///
+/// - The host owns the tracing subscriber. Lore's log output reaches it as `tracing` events.
+/// - The host owns the process's signals. It asks for shutdown with
+///   [`request_shutdown`](Self::request_shutdown) or [`stop`](Self::stop).
+/// - The host supplies the repository policy through [`ServerConfig`], so every enabled
+///   transport enforces it.
+/// - The host's own runtime is never used for Lore's work. Lore's core and net runtimes are
+///   process-wide, built on first use, and stay alive until the process ends: shutting them
+///   down is terminal for the process, so a host that stops and restarts the server in one
+///   process must not do it, and [`stop`](Self::stop) does not.
+///
+/// Dropping the server without calling [`stop`](Self::stop) requests shutdown but does not wait
+/// for the endpoints to drain or for the stores to be flushed and released.
+pub struct EmbeddedServer {
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    stores: ServerStores,
+    task: Option<tokio::task::JoinHandle<Result<StoreHold>>>,
+}
+
+impl EmbeddedServer {
+    /// Starts the server and returns once initialization is complete and the endpoints are
+    /// spawned. "Ready" here does not mean every port is bound: each endpoint binds as its own
+    /// task, a moment after this returns, so a host that must not accept work before then
+    /// probes the endpoint. An endpoint that fails to bind ends the server, which
+    /// [`is_running`](Self::is_running) reports and [`stop`](Self::stop) returns the error of.
+    ///
+    /// # Errors
+    ///
+    /// Returns the initialization error when the stores, the authorizer or the configuration
+    /// cannot be set up, or when the server stops before it is ready.
+    pub async fn start(
+        settings: Settings,
+        settings_hash: StringHash,
+        config: ServerConfig,
+    ) -> Result<Self> {
+        set_fallback_user_agent_product("lore-server".to_string());
+        assume_server_policies();
+        lore_base::log::set_log_callback(Some(server_log_dispatch));
+
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let mode = ServeMode {
+            install_telemetry: false,
+            listen_for_signals: false,
+            shutdown_tx: shutdown_tx.clone(),
+            ready: Some(ready_tx),
+            hold_without_endpoints: true,
+        };
+
+        // Spawned on Lore's core runtime, as the standalone server runs, so that `runtime()`
+        // inside it resolves to the runtime Lore sized for serving, not to the host's.
+        let execution = setup_execution(module_path!(), String::default(), String::default());
+        let task = lore_base::lore_spawn_core!(LORE_CONTEXT.scope(
+            execution,
+            #[allow(clippy::large_futures)]
+            async move {
+                async_main((settings, settings_hash), config, mode).await
+            },
+        ));
+
+        if let Ok(stores) = ready_rx.await {
+            return Ok(Self {
+                shutdown_tx,
+                stores,
+                task: Some(task),
+            });
+        }
+        // The server dropped its readiness sender without using it: it stopped first, and its
+        // result says why.
+        match task.await {
+            Ok(Ok(_hold)) => anyhow::bail!("The Lore server stopped before it was ready"),
+            Ok(Err(error)) => Err(error),
+            Err(join_error) => Err(anyhow!("The Lore server task failed: {join_error}")),
+        }
+    }
+
+    /// The stores the server serves, for in-process operations while it runs.
+    #[must_use]
+    pub fn stores(&self) -> &ServerStores {
+        &self.stores
+    }
+
+    /// Whether the server is still serving. `false` once it was asked to stop and has, or
+    /// once an endpoint ended it.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        self.task.as_ref().is_some_and(|task| !task.is_finished())
+    }
+
+    /// Stops the server accepting work and starts draining what it admitted. Returns at once;
+    /// [`stop`](Self::stop) waits for the drain.
+    pub fn request_shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
+    }
+
+    /// Stops the server and waits for it to drain.
+    ///
+    /// In order: admission stops, the endpoints drain within `connection_close_timeout`, the
+    /// stores are flushed, work spawned as guarded is awaited, and the claim on the local
+    /// stores is released so that the same process can start a server on them again.
+    ///
+    /// Request work that outlives its connection runs in tasks of its own that this cannot
+    /// stop. The standalone server releases its claim only after its runtime has dropped
+    /// them; an embedded one cannot drop a process-wide runtime, so the claim is released
+    /// once the drain ends and any such task is on its own.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error that ended the server, when an endpoint failed.
+    pub async fn stop(mut self) -> Result<()> {
+        self.request_shutdown();
+        let Some(task) = self.task.take() else {
+            return Ok(());
+        };
+        let hold = task
+            .await
+            .map_err(|join_error| anyhow!("The Lore server task failed: {join_error}"))??;
+        lore_base::runtime::runtime_flush_guarded().await;
+        drop(hold);
+        Ok(())
+    }
+}
+
+impl Drop for EmbeddedServer {
+    fn drop(&mut self) {
+        self.request_shutdown();
+    }
 }
 
 /// Waits for a shutdown signal, then drains all endpoints within the given timeout.
@@ -239,8 +420,17 @@ async fn wait_for_shutdown(
     mut endpoints: JoinSet<Result<()>>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     connection_close_timeout: Duration,
+    hold_without_endpoints: bool,
 ) -> Result<()> {
     let mut shutdown_rx = shutdown_tx.subscribe();
+
+    // With no endpoint to wait on, the server serves its stores to the host alone, and runs
+    // until the host asks it to stop.
+    if hold_without_endpoints && endpoints.is_empty() {
+        info!("No endpoint is enabled, serving the stores to the host until shutdown");
+        let _ = shutdown_rx.wait_for(|&v| v).await;
+        return Ok(());
+    }
 
     // Phase 1: wait for signal or unexpected endpoint exit
     info!("Server is up, waiting for shutdown signal");
@@ -1947,7 +2137,11 @@ impl ResourceDetectorProvider for PluginResourceDetectorProvider<'_> {
 /// Serves until shutdown, and returns the hold on the stores it served, for the caller to release
 /// once the runtime has shut down. Request work runs in tasks of its own that closing the
 /// endpoints does not stop, so the stores stay claimed until the runtime has dropped them.
-async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> Result<StoreHold> {
+async fn async_main(
+    settings: (Settings, StringHash),
+    config: ServerConfig,
+    mode: ServeMode,
+) -> Result<StoreHold> {
     // Initialize metrics and tracing telemetry, returns a guard that will cleanup when it falls out
     // of scope
     let (mut settings, settings_hash) = settings;
@@ -1970,17 +2164,23 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     let mut plugin_registry = config.plugin_registry;
     plugins::register_all_plugins(&mut plugin_registry);
 
-    let _guard = {
+    // An embedding host owns the process-wide tracing subscriber, and installing a second one
+    // would fail, so only the standalone server installs it.
+    let _guard = if mode.install_telemetry {
         let resource_detector_provider = PluginResourceDetectorProvider {
             inner: config.resource_detector_provider.as_deref(),
             registry: &plugin_registry,
         };
-        TelemetryInitializer::from_config(
-            &telemetry,
-            runtime.clone(),
-            Some(&resource_detector_provider),
-        )?
-        .init()?
+        Some(
+            TelemetryInitializer::from_config(
+                &telemetry,
+                runtime.clone(),
+                Some(&resource_detector_provider),
+            )?
+            .init()?,
+        )
+    } else {
+        None
     };
 
     observe_task_lifecycles();
@@ -2171,22 +2371,34 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         .as_ref()
         .and_then(|environment| environment.endpoint.as_ref())
         .and_then(|endpoint| endpoint.auth_url.clone());
-    let repository_authorizer = crate::authnz::repository_authorizer::repository_authorizer(
-        settings.server.auth.as_ref(),
-        auth_url.clone(),
-    )?;
+    let repository_authorizer = match config.repository_authorizer {
+        Some(authorizer) => {
+            info!("Repository authorizer: supplied by the embedding host");
+            authorizer
+        }
+        None => crate::authnz::repository_authorizer::repository_authorizer(
+            settings.server.auth.as_ref(),
+            auth_url.clone(),
+        )?,
+    };
     let user_url = settings
         .environment
         .as_ref()
         .and_then(|environment| environment.endpoint.as_ref())
         .and_then(|endpoint| endpoint.user_url.as_deref());
-    let repository_catalog = crate::authnz::repository_catalog::repository_catalog(
-        settings.server.auth.as_ref(),
-        auth_url.as_deref(),
-        user_url,
-        immutable_store.clone(),
-        mutable_store.clone(),
-    )?;
+    let repository_catalog = match config.repository_catalog {
+        Some(catalog) => {
+            info!("Repository catalog: supplied by the embedding host");
+            catalog
+        }
+        None => crate::authnz::repository_catalog::repository_catalog(
+            settings.server.auth.as_ref(),
+            auth_url.as_deref(),
+            user_url,
+            immutable_store.clone(),
+            mutable_store.clone(),
+        )?,
+    };
     info!(
         "Repository registry: {}",
         crate::authnz::repository_registry::RepositoryRegistry::select(
@@ -2226,15 +2438,19 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         _ => None,
     };
 
-    let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+    let shutdown_tx = mode.shutdown_tx;
+    let _shutdown_rx = shutdown_tx.subscribe();
     let mut endpoints = JoinSet::new();
 
     // Spawn signal listener outside the endpoint JoinSet so the drain
-    // timeout only starts after the signal fires.
-    lore_spawn!({
-        let shutdown_tx = shutdown_tx.clone();
-        listen_for_termination(shutdown_tx)
-    });
+    // timeout only starts after the signal fires. An embedding host owns the process's
+    // signals and asks for shutdown through `EmbeddedServer` instead.
+    if mode.listen_for_signals {
+        lore_spawn!({
+            let shutdown_tx = shutdown_tx.clone();
+            listen_for_termination(shutdown_tx)
+        });
+    }
 
     if !is_maintenance {
         // Subscribe authorizes from the request body, so its check is made in
@@ -2280,41 +2496,53 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
 
         let hook_dispatcher = Arc::new(HookDispatcher::from_hooks_default(enabled_hooks));
 
-        lore_spawn!(endpoints, {
-            let immutable_store = immutable_store.clone();
-            let mutable_store = mutable_store.clone();
-            let lock_store = lock_store.clone();
-            let token_verification = token_verification.clone();
-            let repository_authorizer = repository_authorizer.clone();
-            let repository_catalog = repository_catalog.clone();
-            let settings = settings.clone();
-            let notification = notification.clone();
-            let user_agent_filter = user_agent_filter.clone();
-            let forwarded_requests = forwarded_requests.clone();
-            let shutdown_rx = _shutdown_rx.clone();
+        // `enabled` is documented to default to false, and the shipped defaults turn it on, so a
+        // server on the defaults serves gRPC as before. A host that embeds the server turns it
+        // off until its authentication for the endpoint is configured.
+        if settings
+            .server
+            .grpc
+            .as_ref()
+            .is_some_and(|grpc_settings| grpc_settings.enabled)
+        {
+            lore_spawn!(endpoints, {
+                let immutable_store = immutable_store.clone();
+                let mutable_store = mutable_store.clone();
+                let lock_store = lock_store.clone();
+                let token_verification = token_verification.clone();
+                let repository_authorizer = repository_authorizer.clone();
+                let repository_catalog = repository_catalog.clone();
+                let settings = settings.clone();
+                let notification = notification.clone();
+                let user_agent_filter = user_agent_filter.clone();
+                let forwarded_requests = forwarded_requests.clone();
+                let shutdown_rx = _shutdown_rx.clone();
 
-            let local_immutable_store = local_store().unwrap_or_else(|| {
-                warn!("No local store available for gRPC server, operations requiring local store will route to the main store");
-                immutable_store.clone()
+                let local_immutable_store = local_store().unwrap_or_else(|| {
+                    warn!("No local store available for gRPC server, operations requiring local store will route to the main store");
+                    immutable_store.clone()
+                });
+
+                launch_grpc_server(
+                    immutable_store,
+                    local_immutable_store,
+                    mutable_store,
+                    lock_store,
+                    token_verification,
+                    repository_authorizer,
+                    repository_catalog,
+                    settings,
+                    notification,
+                    notification_service,
+                    hook_dispatcher.clone(),
+                    user_agent_filter,
+                    forwarded_requests,
+                    shutdown_rx,
+                )
             });
-
-            launch_grpc_server(
-                immutable_store,
-                local_immutable_store,
-                mutable_store,
-                lock_store,
-                token_verification,
-                repository_authorizer,
-                repository_catalog,
-                settings,
-                notification,
-                notification_service,
-                hook_dispatcher.clone(),
-                user_agent_filter,
-                forwarded_requests,
-                shutdown_rx,
-            )
-        });
+        } else {
+            info!("The public gRPC endpoint is disabled");
+        }
 
         if let Some(grpc_internal) = &settings.server.grpc_internal
             && grpc_internal.enabled
@@ -2610,7 +2838,21 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     }
 
     up_gauge.record(1, &up_attributes);
-    wait_for_shutdown(endpoints, shutdown_tx, connection_close_timeout).await?;
+    if let Some(ready) = mode.ready {
+        // The receiver is gone when the host stopped waiting for readiness, which is fine.
+        let _ = ready.send(ServerStores {
+            immutable: immutable_store.clone(),
+            mutable: mutable_store.clone(),
+            lock: lock_store.clone(),
+        });
+    }
+    wait_for_shutdown(
+        endpoints,
+        shutdown_tx,
+        connection_close_timeout,
+        mode.hold_without_endpoints,
+    )
+    .await?;
     up_gauge.record(0, &up_attributes);
 
     info!("Flushing stores");
