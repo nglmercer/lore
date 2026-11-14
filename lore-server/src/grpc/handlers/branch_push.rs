@@ -11,6 +11,7 @@ use lore_base::lore_spawn;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
 use lore_base::types::Hash;
+use lore_error_set::prelude::*;
 use lore_proto::BranchPushRequest;
 use lore_proto::BranchPushResponse;
 use lore_revision::branch;
@@ -1820,6 +1821,27 @@ async fn verify_fragments(
     Ok(())
 }
 
+/// Whether a branch head the server advances is flushed to disk before the advance is reported.
+/// Set once at startup from `[server] durable_publication`, as the compression mode is.
+static DURABLE_PUBLICATION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Sets whether [`try_store_latest`] makes an advance durable before it returns.
+///
+/// Off by default: a local store writes its changes after a delay, so a process that is killed
+/// within that delay loses a push the client was told succeeded. A host that reports a
+/// publication to its own callers turns this on and pays a flush per advance.
+pub fn set_durable_publication(durable: bool) {
+    DURABLE_PUBLICATION.store(durable, std::sync::atomic::Ordering::Release);
+}
+
+/// Advances the branch head from `current_expected_latest` to `new_latest` when it still is
+/// `current_expected_latest`, and returns the head it found.
+///
+/// With durable publication on, a successful advance returns only once the stores are flushed
+/// and synced: the content store first, since the head names content it indexes. A failed flush
+/// is an error although the head has moved in memory, so the caller must treat the outcome as
+/// uncertain and look the head up rather than assume the advance did not happen.
 #[instrument(level = "debug", skip_all, fields(branch))]
 pub async fn try_store_latest(
     repository: Arc<RepositoryContext>,
@@ -1827,12 +1849,29 @@ pub async fn try_store_latest(
     current_expected_latest: Hash,
     new_latest: Hash,
 ) -> Result<Hash, BranchError> {
-    lore_revision::branch::mutable_try_store(
+    let found = lore_revision::branch::mutable_try_store(
         repository.clone(),
         LATEST,
         branch,
         current_expected_latest,
         new_latest,
     )
-    .await
+    .await?;
+    if found == current_expected_latest
+        && DURABLE_PUBLICATION.load(std::sync::atomic::Ordering::Acquire)
+    {
+        // The content store first: the head names content that it indexes.
+        repository
+            .immutable_store()
+            .flush(lore_storage::FlushOptions::SYNC_DATA)
+            .await
+            .forward::<BranchError>("flushing the immutable store after advancing the branch")?;
+        if let Some(mutable) = repository.try_write_mutable_store() {
+            mutable
+                .flush(lore_storage::FlushOptions::SYNC_DATA)
+                .await
+                .forward::<BranchError>("flushing the mutable store after advancing the branch")?;
+        }
+    }
+    Ok(found)
 }

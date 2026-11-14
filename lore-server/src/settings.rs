@@ -727,6 +727,12 @@ pub struct ServerSettings {
     #[serde(default)]
     pub trust_unsigned_identity: bool,
     pub grpc: Option<GrpcSettings>,
+    /// Flush and sync the stores before a branch advance is reported, so that a push the server
+    /// acknowledged survives the process being killed. Off by default, which leaves the stores'
+    /// flush delay in force: a push is lost if the process is killed before it elapses. A flush
+    /// costs time per advance.
+    #[serde(default)]
+    pub durable_publication: bool,
     /// One block per public gRPC service; an absent table enables every
     /// service.
     #[serde(default)]

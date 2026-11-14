@@ -59,6 +59,13 @@ has nothing else to do. The public gRPC endpoint now honours `[server.grpc] enab
 ignored; the shipped defaults set it to `true`, so a standalone server on the defaults is
 unchanged.
 
+`[server] durable_publication` makes a branch advance flush the content store and then the
+mutable store, with sync, before the advance is reported. A host that tells its own callers a
+publication succeeded needs it: a measured `SIGKILL` right after an acknowledged push lost the
+revision with the default flush delay, and survived with a graceful stop or a kill after the delay.
+It is off by default and costs one flush per advance. The mutable store never schedules a delayed
+flush when its delay is zero, so the delay cannot be tuned away.
+
 `EmbeddedServer::stop` requests shutdown, waits for the endpoints to drain within
 `connection_close_timeout_seconds`, flushes the stores, awaits guarded tasks and releases the
 claim on the local stores. It does not shut down Lore's runtimes: they are process-wide and

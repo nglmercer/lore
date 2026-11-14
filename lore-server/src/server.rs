@@ -2222,6 +2222,10 @@ async fn async_main(
         }));
     }
 
+    crate::grpc::handlers::branch_push::set_durable_publication(
+        settings.server.durable_publication,
+    );
+
     if let Some(mode) = settings
         .environment
         .as_ref()
