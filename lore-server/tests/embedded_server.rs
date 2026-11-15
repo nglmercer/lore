@@ -238,3 +238,43 @@ async fn a_host_reads_branch_heads_without_inventing_revisions() {
 
     server.stop().await.expect("the server stops");
 }
+
+/// A host reads a branch's history in process. A new repository has no revisions, so its history
+/// is empty, and a branch that does not exist is not found.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_lists_branch_history_and_reports_missing_branches() {
+    let root = lore_base::test_util::TempDir::new("lore-embedded-history-");
+    let (settings, hash) = settings_with_grpc(root.path(), free_port(), false);
+    let server = EmbeddedServer::start(settings, hash, ServerConfig::default())
+        .await
+        .expect("the server starts");
+    let admin = server
+        .stores()
+        .repositories
+        .clone()
+        .expect("a serving engine offers repository reads");
+    let id: [u8; 16] = *uuid::Uuid::now_v7().as_bytes();
+    admin
+        .create(lore_proto::RepositoryCreateRequest {
+            id: id.to_vec().into(),
+            name: "history-check".to_string(),
+            description: String::new(),
+            default_branch_id: uuid::Uuid::now_v7().as_bytes().to_vec().into(),
+            default_branch_name: "main".to_string(),
+            creator: "host".to_string(),
+            created: 1,
+        })
+        .await
+        .expect("the repository is created");
+
+    let (revisions, has_more) = admin.branch_history(id, "main", 10).await.expect("lists");
+    assert!(revisions.is_empty());
+    assert!(!has_more);
+    let missing = admin
+        .branch_history(id, "no-such-branch", 10)
+        .await
+        .expect_err("a missing branch is not found");
+    assert_eq!(missing.code(), tonic::Code::NotFound);
+
+    server.stop().await.expect("the server stops");
+}

@@ -343,6 +343,62 @@ impl RepositoryAdmin {
     }
 }
 
+impl RepositoryAdmin {
+    /// The most recent revisions of a branch, newest first, up to `limit`, and whether older ones
+    /// remain. It runs the same listing the branch-revision RPC runs.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` when the repository or the branch does not exist, and `Internal` when the stores
+    /// fail to answer.
+    pub async fn branch_history(
+        &self,
+        repository: [u8; 16],
+        branch_name: &str,
+        limit: u32,
+    ) -> Result<(Vec<lore_proto::Revision>, bool), tonic::Status> {
+        let context = Arc::new(
+            lore_revision::repository::RepositoryContext::new_server_context(
+                self.immutable_store.clone(),
+                self.mutable_store.clone(),
+                lore_base::types::RepositoryId::from(repository),
+            ),
+        );
+        let branch = lore_revision::branch::load_name_to_id(context.clone(), branch_name)
+            .await
+            .map_err(|error| {
+                if error.is_branch_not_found() {
+                    tonic::Status::not_found("the branch does not exist")
+                } else {
+                    tonic::Status::internal(format!("resolving branch {branch_name}: {error:?}"))
+                }
+            })?;
+        let result = lore_revision::branch::list_revisions(
+            context,
+            Some(branch),
+            Some(limit as usize),
+            None,
+            None,
+        )
+        .await
+        .map_err(|error| {
+            if error.is_branch_not_found() {
+                tonic::Status::not_found("the branch does not exist")
+            } else {
+                tonic::Status::internal(format!("listing the history of {branch_name}: {error:?}"))
+            }
+        })?;
+        Ok((
+            result
+                .revisions
+                .iter()
+                .map(lore_proto::Revision::from)
+                .collect(),
+            result.has_more,
+        ))
+    }
+}
+
 /// The instruments of in-process repository creation, in their own namespace so that the metrics
 /// they add are attributable to the host rather than to the RPC.
 struct EmbeddedRepositoryInstruments;
