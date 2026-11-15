@@ -1407,3 +1407,28 @@ async fn an_exchange_whose_refresh_is_unsent_is_disconnected() {
     assert_eq!(stub.presented(), ["refresh-1", "refresh-1"]);
     assert_eq!(stub.exchanges(), 0);
 }
+
+/// The connection's exchange, which every gRPC channel runs at connect, must send a supplied
+/// access token when no identity is named. It used to skip the supplied token and look for a
+/// stored identity instead, so a client that presented its own credentials sent no
+/// authorization header at all, and the server refused the call as unauthenticated.
+#[tokio::test]
+async fn connection_exchange_sends_a_supplied_access_token_without_an_identity() {
+    let (authentication, authorization, _) = auth_exchange(
+        &AuthEndpoint::none(),
+        "remote.example.com",
+        "",
+        RepositoryId::default(),
+        "",
+        "supplied-authz",
+    )
+    .await;
+    assert_eq!(
+        authorization, "supplied-authz",
+        "the supplied access token is the authorization token"
+    );
+    assert!(
+        authentication.is_empty(),
+        "no authentication token is invented for a supplied access token"
+    );
+}

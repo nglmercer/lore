@@ -634,6 +634,18 @@ pub async fn auth_exchange(
         return tokens;
     }
 
+    // A supplied access token is the authorization token whichever identity is named, with no
+    // authentication token invented, as `auth_exchange_for_identity` already does. Without this
+    // an unnamed identity fell through to the stored identities and dropped the token the caller
+    // supplied.
+    if !access_token.is_empty() {
+        return (
+            String::new(),
+            access_token.to_string(),
+            identity.to_string(),
+        );
+    }
+
     if !identity.is_empty() {
         let (tokens, _) = auth_exchange_for_identity(
             auth_endpoint,
