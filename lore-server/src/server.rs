@@ -300,6 +300,47 @@ impl RepositoryAdmin {
         .await?;
         Ok(response.into_inner())
     }
+
+    /// The revision a branch of `repository` points at, as its hexadecimal id, or `None` when the
+    /// repository or branch does not exist or the branch has no revision yet.
+    ///
+    /// It reads the same name mapping and head the branch RPCs read, so a head reported here is
+    /// the head a client fetches.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Internal` when the stores fail to answer, and not for an absent branch.
+    pub async fn branch_head(
+        &self,
+        repository: [u8; 16],
+        branch_name: &str,
+    ) -> Result<Option<String>, tonic::Status> {
+        let context = Arc::new(
+            lore_revision::repository::RepositoryContext::new_server_context(
+                self.immutable_store.clone(),
+                self.mutable_store.clone(),
+                lore_base::types::RepositoryId::from(repository),
+            ),
+        );
+        let branch =
+            match lore_revision::branch::load_name_to_id(context.clone(), branch_name).await {
+                Ok(branch) => branch,
+                Err(error) if error.is_branch_not_found() => return Ok(None),
+                Err(error) => {
+                    return Err(tonic::Status::internal(format!(
+                        "resolving branch {branch_name}: {error:?}"
+                    )));
+                }
+            };
+        match lore_revision::branch::load_latest(context, branch).await {
+            Ok(head) if head.is_zero() => Ok(None),
+            Ok(head) => Ok(Some(head.to_string())),
+            Err(error) if error.is_branch_not_found() => Ok(None),
+            Err(error) => Err(tonic::Status::internal(format!(
+                "reading the head of {branch_name}: {error:?}"
+            ))),
+        }
+    }
 }
 
 /// The instruments of in-process repository creation, in their own namespace so that the metrics

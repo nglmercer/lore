@@ -198,3 +198,43 @@ async fn a_host_creates_repositories_with_the_rpc_semantics() {
 
     server.stop().await.expect("the server stops");
 }
+
+/// A host reads a branch head in process. A new repository's main branch has no revision yet, so
+/// its head is absent, and a branch that does not exist is absent too, not an error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_reads_branch_heads_without_inventing_revisions() {
+    let root = lore_base::test_util::TempDir::new("lore-embedded-head-");
+    let (settings, hash) = settings_with_grpc(root.path(), free_port(), false);
+    let server = EmbeddedServer::start(settings, hash, ServerConfig::default())
+        .await
+        .expect("the server starts");
+    let admin = server
+        .stores()
+        .repositories
+        .clone()
+        .expect("a serving engine offers repository reads");
+    let id: [u8; 16] = *uuid::Uuid::now_v7().as_bytes();
+    admin
+        .create(lore_proto::RepositoryCreateRequest {
+            id: id.to_vec().into(),
+            name: "head-check".to_string(),
+            description: String::new(),
+            default_branch_id: uuid::Uuid::now_v7().as_bytes().to_vec().into(),
+            default_branch_name: "main".to_string(),
+            creator: "host".to_string(),
+            created: 1,
+        })
+        .await
+        .expect("the repository is created");
+
+    assert_eq!(admin.branch_head(id, "main").await.expect("reads"), None);
+    assert_eq!(
+        admin
+            .branch_head(id, "no-such-branch")
+            .await
+            .expect("reads"),
+        None
+    );
+
+    server.stop().await.expect("the server stops");
+}
