@@ -145,3 +145,56 @@ async fn a_server_without_endpoints_keeps_serving_its_stores_until_stopped() {
 
     server.stop().await.expect("the server stops");
 }
+
+/// A host creates a repository in the running engine through the same handler the RPC uses. A
+/// repeated create of the same id and name is an early success, as over the wire. The same id with
+/// another name is `already_exists`, and an invalid name is refused before anything is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_creates_repositories_with_the_rpc_semantics() {
+    let root = lore_base::test_util::TempDir::new("lore-embedded-create-");
+    let (settings, hash) = settings_with_grpc(root.path(), free_port(), false);
+    let server = EmbeddedServer::start(settings, hash, ServerConfig::default())
+        .await
+        .expect("the server starts");
+    let admin = server
+        .stores()
+        .repositories
+        .clone()
+        .expect("a serving engine offers repository creation");
+
+    let request = |id: Vec<u8>, name: &str| lore_proto::RepositoryCreateRequest {
+        id: id.into(),
+        name: name.to_string(),
+        description: "embedded".to_string(),
+        default_branch_id: uuid::Uuid::now_v7().as_bytes().to_vec().into(),
+        default_branch_name: "main".to_string(),
+        creator: "host".to_string(),
+        created: 1,
+    };
+    // The id is a UUIDv7, as the request documents.
+    let repository_id = uuid::Uuid::now_v7().as_bytes().to_vec();
+
+    admin
+        .create(request(repository_id.clone(), "embedded-one"))
+        .await
+        .expect("the first create succeeds");
+    admin
+        .create(request(repository_id.clone(), "embedded-one"))
+        .await
+        .expect("a repeated create of the same id and name is an early success");
+    let conflicting = admin
+        .create(request(repository_id, "embedded-other"))
+        .await
+        .expect_err("the same id with another name is refused");
+    assert_eq!(conflicting.code(), tonic::Code::AlreadyExists);
+
+    let invalid = admin
+        .create(request(
+            uuid::Uuid::now_v7().as_bytes().to_vec(),
+            "bad name with spaces",
+        ))
+        .await;
+    assert!(invalid.is_err(), "an invalid name is refused");
+
+    server.stop().await.expect("the server stops");
+}

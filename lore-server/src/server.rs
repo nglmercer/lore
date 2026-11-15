@@ -260,6 +260,56 @@ pub struct ServerStores {
     pub mutable: Arc<dyn MutableStore>,
     /// The lock store, when one is configured.
     pub lock: Option<Arc<dyn LockStore>>,
+    /// Creates repositories in the running engine. `None` only when the server runs in
+    /// maintenance mode, which serves no repository.
+    pub repositories: Option<RepositoryAdmin>,
+}
+
+/// Creates repositories in the running engine, as the `RepositoryCreate` RPC does, for a host that
+/// embeds the server. It runs the same handler with the same registry, stores and hooks, so a
+/// repository created here is the one a client would create over the wire.
+///
+/// It performs no authorization of its own: the host decides who may create, before calling it.
+#[derive(Clone)]
+pub struct RepositoryAdmin {
+    registry: crate::authnz::repository_registry::RepositoryRegistry,
+    immutable_store: Arc<dyn ImmutableStore>,
+    mutable_store: Arc<dyn MutableStore>,
+    hook_dispatcher: Arc<HookDispatcher>,
+}
+
+impl RepositoryAdmin {
+    /// Creates the repository `request` describes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the status the RPC would return: an invalid id or name, a repository that already
+    /// exists, or a hook that refused the create.
+    pub async fn create(
+        &self,
+        request: lore_proto::RepositoryCreateRequest,
+    ) -> Result<lore_proto::RepositoryCreateResponse, tonic::Status> {
+        let response = crate::grpc::handlers::repository_create::handler(
+            tonic::Request::new(request),
+            &self.registry,
+            self.immutable_store.clone(),
+            self.mutable_store.clone(),
+            &self.hook_dispatcher,
+            &EmbeddedRepositoryInstruments,
+        )
+        .await?;
+        Ok(response.into_inner())
+    }
+}
+
+/// The instruments of in-process repository creation, in their own namespace so that the metrics
+/// they add are attributable to the host rather than to the RPC.
+struct EmbeddedRepositoryInstruments;
+
+impl lore_telemetry::InstrumentProvider for EmbeddedRepositoryInstruments {
+    fn namespace(&self) -> &'static str {
+        "lore.embedded_repository"
+    }
 }
 
 impl ServeMode {
@@ -2456,6 +2506,7 @@ async fn async_main(
         });
     }
 
+    let mut repository_admin: Option<RepositoryAdmin> = None;
     if !is_maintenance {
         // Subscribe authorizes from the request body, so its check is made in
         // the handler rather than by the partition-access layer. It is the
@@ -2499,6 +2550,14 @@ async fn async_main(
             .expect("Failed to create hooks from configuration");
 
         let hook_dispatcher = Arc::new(HookDispatcher::from_hooks_default(enabled_hooks));
+        repository_admin = Some(RepositoryAdmin {
+            registry: crate::authnz::repository_registry::RepositoryRegistry::of(
+                &settings.environment.clone().unwrap_or_default(),
+            ),
+            immutable_store: immutable_store.clone(),
+            mutable_store: mutable_store.clone(),
+            hook_dispatcher: hook_dispatcher.clone(),
+        });
 
         // `enabled` is documented to default to false, and the shipped defaults turn it on, so a
         // server on the defaults serves gRPC as before. A host that embeds the server turns it
@@ -2848,6 +2907,7 @@ async fn async_main(
             immutable: immutable_store.clone(),
             mutable: mutable_store.clone(),
             lock: lock_store.clone(),
+            repositories: repository_admin,
         });
     }
     wait_for_shutdown(
