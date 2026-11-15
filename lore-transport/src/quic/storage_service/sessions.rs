@@ -28,7 +28,6 @@ use tokio::task::JoinHandle;
 use zerocopy::IntoBytes;
 
 use crate::auth::AuthEndpoint;
-use crate::auth::exchange::unsigned_identity_tokens;
 use crate::connection::SuppliedCredentials;
 use crate::error::ProtocolError;
 use crate::quic::client::BoundSession;
@@ -322,13 +321,12 @@ impl Authorizer {
         let (identity_token, access_token) = self.credentials.tokens();
         if self.auth_endpoint.is_none() {
             return Authorization {
-                token: unsigned_identity_tokens(
+                token: crate::auth::exchange::session_token_without_endpoint(
                     &self.auth_endpoint,
                     &self.identity,
                     &identity_token,
                     &access_token,
-                )
-                .map_or_default(|(_, token, _)| token),
+                ),
                 exchanged_with: None,
             };
         }

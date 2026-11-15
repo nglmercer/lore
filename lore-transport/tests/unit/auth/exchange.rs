@@ -1432,3 +1432,47 @@ async fn connection_exchange_sends_a_supplied_access_token_without_an_identity()
         "no authentication token is invented for a supplied access token"
     );
 }
+
+/// The token a storage session presents when the server advertises no authentication. A supplied
+/// access token is the token, as it is; without that a session sent nothing, the server answered
+/// `MissingToken`, and every repository-scoped push and clone was refused.
+#[test]
+fn storage_session_without_an_auth_endpoint_presents_the_supplied_access_token() {
+    let token =
+        session_token_without_endpoint(&AuthEndpoint::none(), "alice", "", "supplied-authz");
+    assert_eq!(token, "supplied-authz");
+}
+
+/// With no supplied access token, a supplied identity token is what the session presents.
+#[test]
+fn storage_session_without_an_auth_endpoint_presents_the_supplied_identity_token() {
+    let token = session_token_without_endpoint(&AuthEndpoint::none(), "alice", "supplied-id", "");
+    assert_eq!(token, "supplied-id");
+}
+
+/// Without any supplied credential the unsigned identity token is kept, as before.
+#[test]
+fn storage_session_without_an_auth_endpoint_keeps_the_unsigned_identity_token() {
+    let token = session_token_without_endpoint(&AuthEndpoint::none(), "alice", "", "");
+    assert!(!token.is_empty(), "an unsigned identity token is presented");
+}
+
+/// With both an identity token and an access token supplied, the identity token is the
+/// authentication token that repository lookups present, and the access token authorizes. A
+/// lookup sent with no authentication token is answered as if the repository did not exist.
+#[tokio::test]
+async fn supplied_identity_and_access_tokens_authenticate_and_authorize() {
+    let (authentication, authorization, _) = auth_exchange(
+        &AuthEndpoint::none(),
+        "remote.example.com",
+        "alice",
+        "00112233445566778899aabbccddeeff"
+            .parse()
+            .expect("a valid repository id"),
+        "supplied-id",
+        "supplied-authz",
+    )
+    .await;
+    assert_eq!(authentication, "supplied-id");
+    assert_eq!(authorization, "supplied-authz");
+}

@@ -611,6 +611,27 @@ pub(crate) fn unsigned_identity_tokens(
     Some((token.clone(), token, identity.to_string()))
 }
 
+/// The token a storage session presents when the server advertises no authentication.
+///
+/// A supplied access token is presented as it is, then a supplied identity token. With neither,
+/// the unsigned identity token is presented, as [`unsigned_identity_tokens`] gives. Empty when
+/// there is none. Read as its own function so the choice is testable without a live session.
+pub fn session_token_without_endpoint(
+    auth_endpoint: &AuthEndpoint,
+    identity: &str,
+    identity_token: &str,
+    access_token: &str,
+) -> String {
+    if !access_token.is_empty() {
+        return access_token.to_string();
+    }
+    if !identity_token.is_empty() {
+        return identity_token.to_string();
+    }
+    unsigned_identity_tokens(auth_endpoint, identity, identity_token, access_token)
+        .map_or_default(|(_, token, _)| token)
+}
+
 /// Resolves an identity and obtains authentication/authorization tokens.
 ///
 /// Returned tuple: (`authentication_token`, `authorization_token`, `resolved_identity`)
@@ -638,7 +659,7 @@ pub async fn auth_exchange(
     // authentication token invented, as `auth_exchange_for_identity` already does. Without this
     // an unnamed identity fell through to the stored identities and dropped the token the caller
     // supplied.
-    if !access_token.is_empty() {
+    if identity_token.is_empty() && !access_token.is_empty() {
         return (
             String::new(),
             access_token.to_string(),
